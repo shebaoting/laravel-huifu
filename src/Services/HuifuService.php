@@ -201,47 +201,35 @@ readonly class HuifuService
         $dataStr = request()->input('resp_data');
         $sign = request()->input('sign');
 
-        // 1. 记录原始回调数据，用于排查问题
-        Log::info('[Huifu Callback Debug]', [
-            'resp_data_preview' => substr($dataStr, 0, 100) . '...', // 只看前100字符
-            'sign_preview'      => substr($sign, 0, 20) . '...',
-            'public_key_check'  => substr(config('huifu.rsa_huifu_public_key'), 0, 20) . '...', // 检查公钥开头
-        ]);
-
-        if (!$dataStr || !$sign) {
-            Log::error('[Huifu] Callback Missing Parameters');
+        if (!$dataStr || !$sign || !$this->verifySign($dataStr, $sign)) {
+            Log::error('[Huifu] Callback Signature Invalid');
             return response('fail', 400);
         }
 
-        // 2. 执行验签
-        if (!$this->verifySign($dataStr, $sign)) {
-            Log::error('[Huifu] Callback Signature Invalid - 请检查 .env 中 HUIFU_PUBLIC_KEY 是否为汇付平台公钥');
-            return response('fail', 400);
-        }
-
-        // 3. 执行业务逻辑
         if ($callback(json_decode($dataStr, true))) {
             return response('success');
         }
-
         return response('fail');
     }
 
     public function verifySign(string $dataStr, string $sign): bool
     {
-        // 确保 resp_data 被正确解析为数组
-        $dataArr = json_decode($dataStr, true);
-
-        if (!is_array($dataArr)) {
-            Log::error('[Huifu] resp_data is not valid JSON');
-            return false;
+        $publicKey = config('huifu.rsa_huifu_public_key');
+        if (BsPayTools::verifySign($sign, $dataStr, $publicKey)) {
+            return true;
         }
 
-        return (bool) BsPayTools::verifySign_sort(
-            $sign,
-            $dataArr,
-            config('huifu.rsa_huifu_public_key')
-        );
+        $data = json_decode($dataStr, true);
+        if (is_array($data) && BsPayTools::verifySign_sort($sign, $data, $publicKey)) {
+            return true;
+        }
+
+        Log::error('[Huifu] All signature verification methods failed.', [
+            'data_sample' => Str::limit($dataStr, 100),
+            'sign_sample' => Str::limit($sign, 20)
+        ]);
+
+        return false;
     }
 
     private function formatAmounts(array &$params): void
