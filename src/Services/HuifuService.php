@@ -23,17 +23,16 @@ readonly class HuifuService
             'openid'    => $openid,
         ];
 
-        return $this->request(\BsPaySdk\request\V2TradePaymentJspayRequest::class, [
+        return $this->request(\BsPaySdk\request\V2TradePaymentJspayRequest::class, array_merge([
             'req_seq_id'      => $orderNo,
             'trans_amt'       => $amount,
             'goods_desc'      => $desc,
             'trade_type'      => 'T_MINIAPP',
-            // 以下参数 SDK 类中没有定义 Setter，会自动进入 extendInfo
-            'delay_acct_flag' => $extra['delay_acct_flag'] ?? 'Y',
+            // 默认参数，可被 $extra 覆盖
+            'delay_acct_flag' => 'Y',
             'notify_url'      => route('api.v1.weapp.payment.huifu_notify'),
-            'wx_data'         => json_encode($wxData), // 必须是 JSON 字符串
-            ...$extra
-        ]);
+            'wx_data'         => json_encode($wxData),
+        ], $extra));
     }
 
     /**
@@ -104,40 +103,42 @@ readonly class HuifuService
      */
     public function request(string $requestClass, array $params = []): array
     {
+        if (!class_exists($requestClass)) {
+            throw new HuifuApiException("SDK Request class not found: {$requestClass}");
+        }
+
         $request = new $requestClass();
 
-        // 自动填充日期
-        if (method_exists($request, 'setReqDate')) $request->setReqDate(date('Ymd'));
-        // 自动生成流水号
-        if (method_exists($request, 'setReqSeqId') && empty($params['req_seq_id'])) {
-            $params['req_seq_id'] = date('YmdHis') . Str::random(8);
+        // 1. 自动填充公共参数
+        if (method_exists($request, 'setReqDate') && empty($params['req_date'])) {
+            $request->setReqDate(date('Ymd'));
         }
-        // 自动填充主商户号
+        if (method_exists($request, 'setReqSeqId') && empty($params['req_seq_id'])) {
+            $request->setReqSeqId(date('YmdHis') . Str::random(8));
+        }
         if (method_exists($request, 'setHuifuId') && empty($params['huifu_id'])) {
             $request->setHuifuId(config('huifu.huifu_id'));
         }
 
-        // 自动进行金额格式化
+        // 2. 格式化金额
         $this->formatAmounts($params);
+
+        // 3. 动态设值
         $extendInfos = [];
-
         foreach ($params as $key => $value) {
-            // 将下划线转驼峰 (如 trans_amt -> setTransAmt)
-            $method = 'set' . str_replace('_', '', ucwords($key, '_'));
+            // 将下划线转驼峰 (trans_amt -> setTransAmt)
+            $method = 'set' . Str::studly($key);
 
-            // 1. 如果 SDK 类中有 set 方法，直接调用
             if (method_exists($request, $method)) {
                 $request->$method($value);
-            }
-            // 2. 如果没有 set 方法，说明这是扩展参数 (如 wx_data, notify_url)，放入 extendInfo
-            else {
+            } else {
+                // 如果没有对应 Setter，则视为扩展参数
                 $extendInfos[$key] = $value;
             }
         }
 
-        // 如果有扩展参数，统一注入到 SDK 对象中
+        // 4. 注入扩展参数
         if (!empty($extendInfos)) {
-            // SDK 的 BaseRequest 有 setExtendInfo 方法
             $request->setExtendInfo($extendInfos);
         }
 
@@ -149,24 +150,35 @@ readonly class HuifuService
      */
     public function exec(object $request): array
     {
-        Log::withContext(['huifu_req_id' => $request->getReqSeqId()]);
+        $seqId = method_exists($request, 'getReqSeqId') ? $request->getReqSeqId() : 'N/A';
+        Log::info("[Huifu] Request Start: {$seqId}", ['class' => get_class($request)]);
 
-        $client = new BsPayClient();
-        $result = $client->postRequest($request);
+        try {
+            $client = new BsPayClient();
+            $result = $client->postRequest($request);
 
-        $rawResponse = method_exists($result, 'getRspDatas') ? $result->getRspDatas() : [];
+            // 检查网络错误或SDK内部错误
+            if (!$result || (method_exists($result, 'isError') && $result->isError())) {
+                $errorInfo = method_exists($result, 'getErrorInfo') ? $result->getErrorInfo() : ['msg' => 'Unknown Error'];
+                Log::error('[Huifu] API Error', ['req_id' => $seqId, 'error' => $errorInfo]);
+                throw new HuifuApiException($errorInfo['msg'] ?? 'Huifu API Error');
+            }
 
-        if (!$result || (method_exists($result, 'isError') && $result->isError())) {
-            $errorInfo = method_exists($result, 'getErrorInfo') ? $result->getErrorInfo() : ['msg' => 'Unknown Error'];
-            // 记录详细错误日志
-            Log::error('[Huifu] API Error', [
-                'request' => (array)$request,
-                'error'   => $errorInfo
-            ]);
-            throw new HuifuApiException($errorInfo);
+            // 获取响应数据
+            $rawResponse = method_exists($result, 'getRspDatas') ? $result->getRspDatas() : [];
+            $data = $rawResponse['data'] ?? $rawResponse; // 兼容不同接口返回结构
+
+            // 检查业务逻辑错误 (resp_code 非 00000000)
+            if (isset($data['resp_code']) && $data['resp_code'] !== '00000000') {
+                Log::error('[Huifu] Business Error', ['req_id' => $seqId, 'resp' => $data]);
+                throw new HuifuApiException($data['resp_desc'] ?? 'Business Error: ' . $data['resp_code']);
+            }
+
+            return $data;
+        } catch (\Exception $e) {
+            Log::error('[Huifu] Exec Exception: ' . $e->getMessage());
+            throw new HuifuApiException($e->getMessage());
         }
-
-        return $rawResponse['data'] ?? $rawResponse;
     }
 
     /**
@@ -194,57 +206,104 @@ readonly class HuifuService
     }
 
     /**
-     * 回调验签助手
+     * 回调处理助手 (包含混合验签)
+     * * @param callable $callback 业务闭包，接收解码后的数据数组，返回 bool
+     * @return string 直接返回 'success' 或 'fail' 字符串给汇付
      */
-    public function handleCallback(callable $callback)
+    public function handleCallback(callable $callback): string
     {
-        $dataStr = request()->input('resp_data');
-        $sign = request()->input('sign');
+        $request = request();
+        $rawContent = $request->getContent(); // 获取最原始的内容
 
+        // 解析 JSON
+        $json = json_decode($rawContent, true);
+        if (!$json) {
+            // 尝试从 POST 字段获取 (兼容 application/x-www-form-urlencoded)
+            $json = $request->all();
+        }
+
+        $dataStr = $json['resp_data'] ?? ''; // 原始字符串
+        $sign = $json['sign'] ?? '';
+
+        // 验签
         if (!$dataStr || !$sign || !$this->verifySign($dataStr, $sign)) {
             Log::error('[Huifu] Callback Signature Invalid');
-            return response('fail', 400);
+            return 'fail';
         }
 
-        if ($callback(json_decode($dataStr, true))) {
-            return response('success');
+        // 验签通过，执行业务回调
+        // 这里需要再次 json_decode resp_data，因为它通常是一个 JSON 字符串
+        $bizData = is_string($dataStr) ? json_decode($dataStr, true) : $dataStr;
+
+        try {
+            if ($callback($bizData) === true) {
+                return 'success';
+            }
+        } catch (\Throwable $e) {
+            Log::error('[Huifu] Callback Logic Error: ' . $e->getMessage());
         }
-        return response('fail');
+
+        return 'fail';
     }
 
+    /**
+     * 混合验签策略 (核心修正)
+     */
     public function verifySign(string $dataStr, string $sign): bool
     {
-        $publicKey = config('huifu.rsa_huifu_public_key');
-        // 汇付文档中，异步回调的 resp_data 就是一个 JSON 字符串，而不是对象
-        if (BsPayTools::verifySign($sign, $dataStr, $publicKey)) {
+        $publicKey = config('huifu.sys_plat_puk'); // 务必确保读取的是汇付平台公钥
+
+        // 补全公钥头尾 (如果配置里只填了中间那串)
+        if (!str_contains($publicKey, 'BEGIN PUBLIC KEY')) {
+            $publicKey = "-----BEGIN PUBLIC KEY-----\n" .
+                chunk_split($publicKey, 64, "\n") .
+                "-----END PUBLIC KEY-----";
+        }
+
+        // 【策略A】优先验证原始字符串 (解决浮点数精度、空对象转义问题)
+        // 这是最稳的方式，只要汇付发过来的字符串没被改动，这里必过。
+        if (openssl_verify($dataStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256) === 1) {
+            Log::debug('[Huifu] Verify Strategy A (Raw String) Passed');
             return true;
         }
-        // 这是处理乱序 JSON 的标准方法
-        $data = json_decode($dataStr, true);
-        if (is_array($data)) {
-            if (BsPayTools::verifySign_sort($sign, $data, $publicKey)) {
+
+        // 【策略B】降级到 SDK 标准验签 (解码 -> 排序 -> 编码)
+        // 解决因 JSON 键值对顺序不一致导致的问题
+        $dataArr = json_decode($dataStr, true);
+        if (is_array($dataArr)) {
+            if (BsPayTools::verifySign_sort($sign, $dataArr, $publicKey)) {
+                Log::debug('[Huifu] Verify Strategy B (Sorted Array) Passed');
                 return true;
             }
         }
-        // 有时候 PHP 接收到的 POST 数据会自动对引号加反斜杠，导致验签失败
+
+        // 【策略C】处理反斜杠转义 (极端情况兜底)
         $strippedDataStr = stripslashes($dataStr);
-        if ($strippedDataStr !== $dataStr && BsPayTools::verifySign($sign, $strippedDataStr, $publicKey)) {
-            return true;
+        if ($strippedDataStr !== $dataStr) {
+            if (openssl_verify($strippedDataStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256) === 1) {
+                Log::debug('[Huifu] Verify Strategy C (Stripped Slashes) Passed');
+                return true;
+            }
         }
 
-        Log::error('[Huifu] Callback Signature Invalid', [
-            'data_sample' => Str::limit($dataStr, 100),
-            'sign_sample' => Str::limit($sign, 20)
+        Log::error('[Huifu] All Verification Strategies Failed', [
+            'sign_sample' => substr($sign, 0, 20) . '...',
+            'data_sample' => substr($dataStr, 0, 100) . '...'
         ]);
 
         return false;
     }
 
+    /**
+     * 格式化金额 (保留2位小数)
+     */
     private function formatAmounts(array &$params): void
     {
-        $keys = ['trans_amt', 'ord_amt', 'div_amt', 'cash_amt', 'refund_amt'];
-        foreach ($keys as $k) {
-            if (isset($params[$k])) $params[$k] = number_format((float)$params[$k], 2, '.', '');
+        $moneyKeys = ['trans_amt', 'ord_amt', 'div_amt', 'cash_amt', 'refund_amt'];
+        foreach ($moneyKeys as $k) {
+            if (isset($params[$k])) {
+                $params[$k] = number_format((float)$params[$k], 2, '.', '');
+            }
         }
     }
 }
