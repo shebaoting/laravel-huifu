@@ -9,6 +9,12 @@ use BsPaySdk\core\BsPayTools;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Shebaoting\Huifu\Exceptions\HuifuApiException;
+use BsPaySdk\request\V2TradePaymentJspayRequest;
+use BsPaySdk\request\V2TradePaymentDelaytransConfirmRequest;
+use BsPaySdk\request\V2TradeAcctpaymentBalanceQueryRequest;
+use BsPaySdk\request\V2SupplementaryPictureRequest;
+use BsPaySdk\request\V2TradePaymentScanpayRefundRequest;
+use BsPaySdk\request\V3TradePaymentScanpayQueryRequest;
 
 readonly class HuifuService
 {
@@ -23,7 +29,7 @@ readonly class HuifuService
             'openid'    => $openid,
         ];
 
-        return $this->request(\BsPaySdk\request\V2TradePaymentJspayRequest::class, [
+        return $this->request(V2TradePaymentJspayRequest::class, [
             'req_seq_id'      => $orderNo,
             'trans_amt'       => $amount,
             'goods_desc'      => $desc,
@@ -68,7 +74,7 @@ readonly class HuifuService
      */
     public function confirmAllocation(string $orderNo, string $orderDate, float $totalAmt, array $acctInfos): array
     {
-        return $this->request(\BsPaySdk\request\V2TradePaymentDelaytransConfirmRequest::class, [
+        return $this->request(V2TradePaymentDelaytransConfirmRequest::class, [
             'org_req_seq_id'   => $orderNo,
             'org_req_date'     => $orderDate,
             'trans_amt'        => $totalAmt,
@@ -81,7 +87,7 @@ readonly class HuifuService
      */
     public function getBalance(string $huifuId = null): float
     {
-        $res = $this->request(\BsPaySdk\request\V2TradeAcctpaymentBalanceQueryRequest::class, [
+        $res = $this->request(V2TradeAcctpaymentBalanceQueryRequest::class, [
             'huifu_id' => $huifuId ?? config('huifu.huifu_id')
         ]);
         return (float) ($res['acct_bal'] ?? 0);
@@ -92,7 +98,7 @@ readonly class HuifuService
      */
     public function uploadImage(string $localPath, string $fileType = 'F55'): string
     {
-        $res = $this->request(\BsPaySdk\request\V2SupplementaryPictureRequest::class, [
+        $res = $this->request(V2SupplementaryPictureRequest::class, [
             'file_type' => $fileType,
             'file'      => new \CURLFile($localPath),
         ]);
@@ -177,7 +183,7 @@ readonly class HuifuService
      */
     public function refund(string $orgOrderNo, string $orgOrderDate, float|string $amount, string $reason = '用户申请退款'): array
     {
-        return $this->request(\BsPaySdk\request\V2TradePaymentScanpayRefundRequest::class, [
+        return $this->request(V2TradePaymentScanpayRefundRequest::class, [
             'org_req_seq_id' => $orgOrderNo,
             'org_req_date'   => $orgOrderDate,
             'ord_amt'        => $amount,
@@ -190,7 +196,7 @@ readonly class HuifuService
      */
     public function queryOrder(string $orderNo, string $orderDate): array
     {
-        return $this->request(\BsPaySdk\request\V3TradePaymentScanpayQueryRequest::class, [
+        return $this->request(V3TradePaymentScanpayQueryRequest::class, [
             'org_req_seq_id' => $orderNo,
             'org_req_date'   => $orderDate,
         ]);
