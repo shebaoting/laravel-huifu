@@ -17,8 +17,9 @@ readonly class HuifuService
      */
     public function miniAppPay(string $orderNo, float|string $amount, string $desc, string $openid, array $extra = []): array
     {
+        // 构造微信参数，注意 key 为 openid
         $wxData = [
-            'sub_appid' => config('huifu.sub_appid'),
+            'sub_appid' => config('huifu.sub_appid') ?: config('services.wechat.mini_app_id'),
             'openid'    => $openid,
         ];
 
@@ -27,15 +28,16 @@ readonly class HuifuService
             'trans_amt'       => $amount,
             'goods_desc'      => $desc,
             'trade_type'      => 'T_MINIAPP',
+            // 以下参数 SDK 类中没有定义 Setter，会自动进入 extendInfo
             'delay_acct_flag' => $extra['delay_acct_flag'] ?? 'Y',
-            'wx_data'         => json_encode($wxData), // 自动处理 JSON 序列化
+            'notify_url'      => route('api.v1.weapp.payment.huifu_notify'),
+            'wx_data'         => json_encode($wxData), // 必须是 JSON 字符串
             ...$extra
         ]);
     }
 
     /**
-     * 2. 按比例分账 (傻瓜式)
-     * splits 格式: ['商户号' => 0.9, '商户号2' => 0.05]
+     * 2. 按比例分账
      */
     public function splitByRatio(string $orderNo, string $orderDate, float $totalAmount, array $splits): array
     {
@@ -50,7 +52,7 @@ readonly class HuifuService
     }
 
     /**
-     * 3. 按固定金额分账 (傻瓜式)
+     * 3. 按固定金额分账
      */
     public function splitByAmount(string $orderNo, string $orderDate, array $amounts): array
     {
@@ -86,7 +88,7 @@ readonly class HuifuService
     }
 
     /**
-     * 6. 图片上传 (傻瓜式：直接传本地路径)
+     * 6. 图片上传
      */
     public function uploadImage(string $localPath, string $fileType = 'F55'): string
     {
@@ -115,21 +117,35 @@ readonly class HuifuService
             $request->setHuifuId(config('huifu.huifu_id'));
         }
 
-        // 自动进行金额格式化 (傻瓜化核心)
+        // 自动进行金额格式化
         $this->formatAmounts($params);
+        $extendInfos = [];
 
         foreach ($params as $key => $value) {
+            // 将下划线转驼峰 (如 trans_amt -> setTransAmt)
             $method = 'set' . str_replace('_', '', ucwords($key, '_'));
+
+            // 1. 如果 SDK 类中有 set 方法，直接调用
             if (method_exists($request, $method)) {
                 $request->$method($value);
             }
+            // 2. 如果没有 set 方法，说明这是扩展参数 (如 wx_data, notify_url)，放入 extendInfo
+            else {
+                $extendInfos[$key] = $value;
+            }
+        }
+
+        // 如果有扩展参数，统一注入到 SDK 对象中
+        if (!empty($extendInfos)) {
+            // SDK 的 BaseRequest 有 setExtendInfo 方法
+            $request->setExtendInfo($extendInfos);
         }
 
         return $this->exec($request);
     }
 
     /**
-     * 8. 执行并解析私有属性 (解决你之前的空数组报错)
+     * 8. 执行并解析
      */
     public function exec(object $request): array
     {
@@ -138,11 +154,15 @@ readonly class HuifuService
         $client = new BsPayClient();
         $result = $client->postRequest($request);
 
-        // 核心：调用带 s 的方法获取私有属性
         $rawResponse = method_exists($result, 'getRspDatas') ? $result->getRspDatas() : [];
 
         if (!$result || (method_exists($result, 'isError') && $result->isError())) {
             $errorInfo = method_exists($result, 'getErrorInfo') ? $result->getErrorInfo() : ['msg' => 'Unknown Error'];
+            // 记录详细错误日志
+            Log::error('[Huifu] API Error', [
+                'request' => (array)$request,
+                'error'   => $errorInfo
+            ]);
             throw new HuifuApiException($errorInfo);
         }
 
@@ -150,7 +170,31 @@ readonly class HuifuService
     }
 
     /**
-     * 一键处理回调
+     * 9. 极简退款
+     */
+    public function refund(string $orgOrderNo, string $orgOrderDate, float|string $amount, string $reason = '用户申请退款'): array
+    {
+        return $this->request(\BsPaySdk\request\V2TradePaymentScanpayRefundRequest::class, [
+            'org_req_seq_id' => $orgOrderNo,
+            'org_req_date'   => $orgOrderDate,
+            'ord_amt'        => $amount,
+            'remark'         => $reason,
+        ]);
+    }
+
+    /**
+     * 10. 订单查询
+     */
+    public function queryOrder(string $orderNo, string $orderDate): array
+    {
+        return $this->request(\BsPaySdk\request\V3TradePaymentScanpayQueryRequest::class, [
+            'org_req_seq_id' => $orderNo,
+            'org_req_date'   => $orderDate,
+        ]);
+    }
+
+    /**
+     * 回调验签助手
      */
     public function handleCallback(callable $callback)
     {
@@ -158,6 +202,7 @@ readonly class HuifuService
         $sign = request()->input('sign');
 
         if (!$dataStr || !$sign || !$this->verifySign($dataStr, $sign)) {
+            Log::error('[Huifu] Callback Signature Invalid');
             return response('fail', 400);
         }
 
