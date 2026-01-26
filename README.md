@@ -1,4 +1,4 @@
-# Laravel Huifu (shebaoting 版)
+# Laravel Huifu
 
 [![Latest Version on Packagist](https://img.shields.io/packagist/v/shebaoting/laravel-huifu.svg?style=flat-square)](https://packagist.org/packages/shebaoting/laravel-huifu)
 [![Total Downloads](https://img.shields.io/packagist/dt/shebaoting/laravel-huifu.svg?style=flat-square)](https://packagist.org/packages/shebaoting/laravel-huifu)
