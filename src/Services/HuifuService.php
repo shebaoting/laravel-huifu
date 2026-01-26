@@ -215,14 +215,48 @@ readonly class HuifuService
         return response('fail');
     }
 
+    /**
+     * 增强版验签方法
+     * 解决 PHP json_decode 将空对象 {} 转为 [] 导致验签失败的问题
+     */
     public function verifySign(string $dataStr, string $sign): bool
     {
-        log::debug('[Huifu] Verify Sign', [
-            'data' => $dataStr,
-            'sign' => $sign,
-            'pub_key' => config('huifu.rsa_huifu_public_key'),
-        ]);
-        return (bool) BsPayTools::verifySign_sort($sign, json_decode($dataStr, true), config('huifu.rsa_huifu_public_key'));
+        $publicKey = config('huifu.rsa_huifu_public_key');
+
+        // 策略 A：直接使用 SDK 的 verifySign 验证原始字符串
+        // 如果汇付返回的 JSON 顺序本身就是排好序的，或者是对原串签名的，这一步直接通过，效率最高。
+        if (BsPayTools::verifySign($sign, $dataStr, $publicKey)) {
+            return true;
+        }
+
+        // 策略 B：由于策略 A 失败（说明顺序不同），我们需要解码、排序、重组后再验
+        // 这里必须处理 PHP 将 {} 转为 [] 的 Bug
+        $data = json_decode($dataStr, true);
+
+        // 定义哪些字段如果是空的，必须转回对象 {}
+        // 这些字段名来自汇付文档和你的报错日志
+        $forceObjectFields = [
+            'risk_check_data',
+            'risk_check_info',
+            'wx_response',
+            'alipay_response',
+            'unionpay_response',
+            'acct_split_bunch',
+            'terminal_device_data',
+            'card_info',
+            'bank_info_data'
+        ];
+
+        foreach ($forceObjectFields as $field) {
+            // 如果字段存在、是数组、且为空，强制转为 (object)[]
+            // 这样 json_encode 就会输出 {} 而不是 []
+            if (isset($data[$field]) && is_array($data[$field]) && empty($data[$field])) {
+                $data[$field] = (object)[];
+            }
+        }
+
+        // 调用 SDK 的排序验签方法
+        return (bool) BsPayTools::verifySign_sort($sign, $data, $publicKey);
     }
 
     private function formatAmounts(array &$params): void
