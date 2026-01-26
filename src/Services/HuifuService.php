@@ -201,20 +201,47 @@ readonly class HuifuService
         $dataStr = request()->input('resp_data');
         $sign = request()->input('sign');
 
-        if (!$dataStr || !$sign || !$this->verifySign($dataStr, $sign)) {
-            Log::error('[Huifu] Callback Signature Invalid');
+        // 1. 记录原始回调数据，用于排查问题
+        Log::info('[Huifu Callback Debug]', [
+            'resp_data_preview' => substr($dataStr, 0, 100) . '...', // 只看前100字符
+            'sign_preview'      => substr($sign, 0, 20) . '...',
+            'public_key_check'  => substr(config('huifu.rsa_huifu_public_key'), 0, 20) . '...', // 检查公钥开头
+        ]);
+
+        if (!$dataStr || !$sign) {
+            Log::error('[Huifu] Callback Missing Parameters');
             return response('fail', 400);
         }
 
+        // 2. 执行验签
+        if (!$this->verifySign($dataStr, $sign)) {
+            Log::error('[Huifu] Callback Signature Invalid - 请检查 .env 中 HUIFU_PUBLIC_KEY 是否为汇付平台公钥');
+            return response('fail', 400);
+        }
+
+        // 3. 执行业务逻辑
         if ($callback(json_decode($dataStr, true))) {
             return response('success');
         }
+
         return response('fail');
     }
 
     public function verifySign(string $dataStr, string $sign): bool
     {
-        return (bool) BsPayTools::verifySign_sort($sign, json_decode($dataStr, true), config('huifu.rsa_huifu_public_key'));
+        // 确保 resp_data 被正确解析为数组
+        $dataArr = json_decode($dataStr, true);
+
+        if (!is_array($dataArr)) {
+            Log::error('[Huifu] resp_data is not valid JSON');
+            return false;
+        }
+
+        return (bool) BsPayTools::verifySign_sort(
+            $sign,
+            $dataArr,
+            config('huifu.rsa_huifu_public_key')
+        );
     }
 
     private function formatAmounts(array &$params): void
