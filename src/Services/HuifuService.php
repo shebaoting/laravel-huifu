@@ -217,6 +217,11 @@ readonly class HuifuService
 
     public function verifySign(string $dataStr, string $sign): bool
     {
+        log::debug('[Huifu] Verify Sign', [
+            'data' => $dataStr,
+            'sign' => $sign,
+            'pub_key' => config('huifu.rsa_huifu_public_key'),
+        ]);
         return (bool) BsPayTools::verifySign_sort($sign, json_decode($dataStr, true), config('huifu.rsa_huifu_public_key'));
     }
 
