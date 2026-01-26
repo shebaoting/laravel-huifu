@@ -148,52 +148,57 @@ readonly class HuifuService
     /**
      * 8. 执行并解析
      */
-    public function exec(object $request): array
+    /**
+     * 执行底层请求并处理响应
+     *
+     * @param mixed $requestObj 请求对象
+     * @return array
+     * @throws HuifuApiException
+     */
+    protected function exec($requestObj): array
     {
-        $seqId = method_exists($request, 'getReqSeqId') ? $request->getReqSeqId() : 'N/A';
-        Log::info("[Huifu] Request Start: {$seqId}", ['class' => get_class($request)]);
+        // 1. 初始化官方客户端
+        $client = new BsPayClient();
 
-        try {
-            $client = new BsPayClient();
-            $result = $client->postRequest($request);
+        // 2. 记录请求日志
+        $seqId = method_exists($requestObj, 'getReqSeqId') ? $requestObj->getReqSeqId() : 'N/A';
+        Log::info('[Huifu] Request Start: ' . $seqId, [
+            'class' => get_class($requestObj),
+            // 'params' => $requestObj->getExtendInfos() // 如有需要可开启详细参数日志
+        ]);
 
-            // 1. 检查 SDK 层面/网络层面的错误
-            if (!$result || (method_exists($result, 'isError') && $result->isError())) {
-                $errorInfo = method_exists($result, 'getErrorInfo') ? $result->getErrorInfo() : ['msg' => 'Unknown Error'];
-                if (is_string($errorInfo)) {
-                    $errorInfo = ['resp_code' => 'SDK_ERROR', 'resp_desc' => $errorInfo];
-                }
+        // 3. 发送请求
+        $result = $client->postRequest($requestObj);
 
-                Log::error('[Huifu] API Error', ['req_id' => $seqId, 'error' => $errorInfo]);
-                throw new HuifuApiException($errorInfo);
-            }
-
-            // 2. 获取响应数据
-            $rawResponse = method_exists($result, 'getRspDatas') ? $result->getRspDatas() : [];
-            $data = $rawResponse['data'] ?? $rawResponse;
-
-            // 3. 检查业务逻辑错误
-            $successCodes = ['00000000', '00000100'];
-
-            if (isset($data['resp_code']) && !in_array($data['resp_code'], $successCodes)) {
-                Log::error('[Huifu] Business Error', ['req_id' => $seqId, 'resp' => $data]);
-                throw new HuifuApiException($data);
-            }
-
-            return $data;
-        } catch (\Exception $e) {
-            // 如果已经是 HuifuApiException，直接往上抛
-            if ($e instanceof HuifuApiException) {
-                throw $e;
-            }
-
-            Log::error('[Huifu] Exec Exception: ' . $e->getMessage());
-            // 【修复2】包装成数组
+        // 4. 检查网络或系统级错误
+        if (empty($result) || !is_array($result)) {
+            Log::error('[Huifu] System Error: Empty or Invalid Response', ['seq_id' => $seqId]);
             throw new HuifuApiException([
-                'resp_code' => 'SYS_EXCEPTION',
-                'resp_desc' => $e->getMessage()
+                'resp_code' => 'SYSTEM_ERROR',
+                'resp_desc' => '汇付接口无响应或返回格式错误'
             ]);
         }
+
+        // 5. 【核心修复】检查业务状态码
+        $respCode = $result['resp_code'] ?? '';
+
+        // 允许 '00000000' (成功) 和 '00000100' (处理中/预下单成功)
+        if ($respCode !== '00000000' && $respCode !== '00000100') {
+
+            // 记录业务错误日志
+            Log::error('[Huifu] Business Error', [
+                'req_id' => $seqId,
+                'resp'   => $result
+            ]);
+
+            // 【核心修复】抛出异常时必须传数组，原代码可能传了字符串导致 TypeError
+            throw new HuifuApiException($result);
+        }
+
+        // 6. 记录成功/处理中日志（可选）
+        Log::info('[Huifu] Request Success', ['req_id' => $seqId, 'code' => $respCode]);
+
+        return $result;
     }
 
     /**
