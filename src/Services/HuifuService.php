@@ -215,16 +215,24 @@ readonly class HuifuService
     public function verifySign(string $dataStr, string $sign): bool
     {
         $publicKey = config('huifu.rsa_huifu_public_key');
+        // 汇付文档中，异步回调的 resp_data 就是一个 JSON 字符串，而不是对象
         if (BsPayTools::verifySign($sign, $dataStr, $publicKey)) {
             return true;
         }
-
+        // 这是处理乱序 JSON 的标准方法
         $data = json_decode($dataStr, true);
-        if (is_array($data) && BsPayTools::verifySign_sort($sign, $data, $publicKey)) {
+        if (is_array($data)) {
+            if (BsPayTools::verifySign_sort($sign, $data, $publicKey)) {
+                return true;
+            }
+        }
+        // 有时候 PHP 接收到的 POST 数据会自动对引号加反斜杠，导致验签失败
+        $strippedDataStr = stripslashes($dataStr);
+        if ($strippedDataStr !== $dataStr && BsPayTools::verifySign($sign, $strippedDataStr, $publicKey)) {
             return true;
         }
 
-        Log::error('[Huifu] All signature verification methods failed.', [
+        Log::error('[Huifu] Callback Signature Invalid', [
             'data_sample' => Str::limit($dataStr, 100),
             'sign_sample' => Str::limit($sign, 20)
         ]);
