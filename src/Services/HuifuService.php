@@ -258,15 +258,11 @@ readonly class HuifuService
 
         return 'fail';
     }
-
     /**
-     * 混合验签策略 (核心修正)
-     */
-    /**
-     * 验证签名 (修复 Octane 兼容性与增强验签逻辑)
+     * 验证签名 (修复 Octane 兼容性与配置读取)
      *
      * @param array $data 回调数组
-     * @param string|null $body 原始请求体 (Octane环境下必须传入)
+     * @param string|null $body 原始请求体
      * @return void
      * @throws HuifuApiException
      */
@@ -275,22 +271,21 @@ readonly class HuifuService
         if ($body === null) {
             $body = request()->getContent();
         }
-
-        // 强制转为字符串，防止 null 传给 str_contains 导致报错
         $dataStr = (string) $body;
 
-        // 2. 获取签名串
         $sign = $data['sign'] ?? '';
         if (empty($sign)) {
             Log::error('[Huifu] Missing Signature', ['data' => $data]);
             throw new HuifuApiException(['resp_code' => 'FAIL', 'resp_desc' => '回调缺少签名参数']);
         }
 
-        // 3. 准备公钥
-        $publicKey = config('huifu.sys_plat_puk');
+        $publicKey = config('huifu.rsa_huifu_public_key');
+
         if (empty($publicKey)) {
+            Log::error('[Huifu] Config Error: rsa_huifu_public_key not found in config/huifu.php');
             throw new HuifuApiException(['resp_code' => 'FAIL', 'resp_desc' => '系统公钥未配置']);
         }
+        $publicKey = (string) $publicKey;
 
         if (!str_contains($publicKey, 'BEGIN PUBLIC KEY')) {
             $publicKey = "-----BEGIN PUBLIC KEY-----\n" .
@@ -298,35 +293,35 @@ readonly class HuifuService
                 "-----END PUBLIC KEY-----";
         }
 
-        // 4. 执行多重验签策略
         $verifyA = openssl_verify($dataStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256);
         if ($verifyA === 1) {
-            return;
+            return; // 验签通过
         }
 
         if (class_exists(BsPayTools::class)) {
             $dataForSort = $data;
             unset($dataForSort['sign']);
-
-            $paramStr = BsPayTools::filterAndSort($dataForSort); // 假设 SDK 有这个 helper，或者是 ksort 处理
-
-            if (openssl_verify($paramStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256) === 1) {
-                Log::debug('[Huifu] Verify Strategy B (Sorted Array) Passed');
-                return;
+            try {
+                ksort($dataForSort);
+                $paramStr = json_encode($dataForSort, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                if (openssl_verify($paramStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256) === 1) {
+                    return;
+                }
+            } catch (\Exception $e) {
+                // 忽略排序转换错误
             }
         }
+
         $strippedDataStr = stripslashes($dataStr);
         if ($strippedDataStr !== $dataStr) {
             if (openssl_verify($strippedDataStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256) === 1) {
-                Log::debug('[Huifu] Verify Strategy C (Stripped Slashes) Passed');
                 return;
             }
         }
 
         Log::error('[Huifu] Signature Verify Failed', [
-            'sign_prefix' => substr($sign, 0, 10) . '...',
-            'body_sample' => substr($dataStr, 0, 200),
-            'strategies_tried' => ['Raw', 'Sorted', 'Stripped']
+            'sign_sample' => substr($sign, 0, 10) . '...',
+            'data_len'    => strlen($dataStr)
         ]);
 
         throw new HuifuApiException(['resp_code' => 'FAIL', 'resp_desc' => '验签失败']);
