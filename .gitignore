@@ -1,3 +1,5 @@
 /vendor
 composer.lock
 .phpunit.result.cache
+scan_php.py
+combined_php_code.md
