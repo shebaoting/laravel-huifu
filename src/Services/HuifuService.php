@@ -226,41 +226,34 @@ readonly class HuifuService
     }
 
     /**
-     * 回调处理助手 (包含混合验签)
-     * * @param callable $callback 业务闭包，接收解码后的数据数组，返回 bool
-     * @return string 直接返回 'success' 或 'fail' 字符串给汇付
+     * 处理回调
+     *
+     * @param callable $callback 业务逻辑回调
+     * @return mixed
+     * @throws HuifuApiException
      */
-    public function handleCallback(callable $callback): string
+    public function handleCallback(callable $callback)
     {
         $request = request();
-        $rawContent = $request->getContent(); // 获取最原始的内容
+        $data = $request->all();
 
-        // 解析 JSON
-        $json = json_decode($rawContent, true);
-        if (!$json) {
-            // 尝试从 POST 字段获取 (兼容 application/x-www-form-urlencoded)
-            $json = $request->all();
+        // [Octane 修复] 显式获取 Raw Body，解决 php://input 为空的问题
+        $rawContent = $request->getContent();
+
+        Log::info('[Huifu] Notify Data:', $data);
+
+        // 验证签名 (传入 rawContent)
+        $this->verifySign($data, $rawContent);
+
+        // 执行业务回调
+        $result = $callback($data);
+
+        if (is_bool($result) && $result) {
+            return 'success';
         }
 
-        $dataStr = $json['resp_data'] ?? ''; // 原始字符串
-        $sign = $json['sign'] ?? '';
-
-        // 验签
-        if (!$dataStr || !$sign || !$this->verifySign($dataStr, $sign)) {
-            Log::error('[Huifu] Callback Signature Invalid');
-            return 'fail';
-        }
-
-        // 验签通过，执行业务回调
-        // 这里需要再次 json_decode resp_data，因为它通常是一个 JSON 字符串
-        $bizData = is_string($dataStr) ? json_decode($dataStr, true) : $dataStr;
-
-        try {
-            if ($callback($bizData) === true) {
-                return 'success';
-            }
-        } catch (\Throwable $e) {
-            Log::error('[Huifu] Callback Logic Error: ' . $e->getMessage());
+        if ($result === 'success') {
+            return 'success';
         }
 
         return 'fail';
@@ -269,49 +262,74 @@ readonly class HuifuService
     /**
      * 混合验签策略 (核心修正)
      */
-    public function verifySign(string $dataStr, string $sign): bool
+    /**
+     * 验证签名 (修复 Octane 兼容性与增强验签逻辑)
+     *
+     * @param array $data 回调数组
+     * @param string|null $body 原始请求体 (Octane环境下必须传入)
+     * @return void
+     * @throws HuifuApiException
+     */
+    protected function verifySign(array $data, $body = null): void
     {
-        $publicKey = config('huifu.sys_plat_puk'); // 务必确保读取的是汇付平台公钥
+        if ($body === null) {
+            $body = request()->getContent();
+        }
 
-        // 补全公钥头尾 (如果配置里只填了中间那串)
+        // 强制转为字符串，防止 null 传给 str_contains 导致报错
+        $dataStr = (string) $body;
+
+        // 2. 获取签名串
+        $sign = $data['sign'] ?? '';
+        if (empty($sign)) {
+            Log::error('[Huifu] Missing Signature', ['data' => $data]);
+            throw new HuifuApiException(['resp_code' => 'FAIL', 'resp_desc' => '回调缺少签名参数']);
+        }
+
+        // 3. 准备公钥
+        $publicKey = config('huifu.sys_plat_puk');
+        if (empty($publicKey)) {
+            throw new HuifuApiException(['resp_code' => 'FAIL', 'resp_desc' => '系统公钥未配置']);
+        }
+
         if (!str_contains($publicKey, 'BEGIN PUBLIC KEY')) {
             $publicKey = "-----BEGIN PUBLIC KEY-----\n" .
                 chunk_split($publicKey, 64, "\n") .
                 "-----END PUBLIC KEY-----";
         }
 
-        // 【策略A】优先验证原始字符串 (解决浮点数精度、空对象转义问题)
-        // 这是最稳的方式，只要汇付发过来的字符串没被改动，这里必过。
-        if (openssl_verify($dataStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256) === 1) {
-            Log::debug('[Huifu] Verify Strategy A (Raw String) Passed');
-            return true;
+        // 4. 执行多重验签策略
+        $verifyA = openssl_verify($dataStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256);
+        if ($verifyA === 1) {
+            return;
         }
 
-        // 【策略B】降级到 SDK 标准验签 (解码 -> 排序 -> 编码)
-        // 解决因 JSON 键值对顺序不一致导致的问题
-        $dataArr = json_decode($dataStr, true);
-        if (is_array($dataArr)) {
-            if (BsPayTools::verifySign_sort($sign, $dataArr, $publicKey)) {
+        if (class_exists(BsPayTools::class)) {
+            $dataForSort = $data;
+            unset($dataForSort['sign']);
+
+            $paramStr = BsPayTools::filterAndSort($dataForSort); // 假设 SDK 有这个 helper，或者是 ksort 处理
+
+            if (openssl_verify($paramStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256) === 1) {
                 Log::debug('[Huifu] Verify Strategy B (Sorted Array) Passed');
-                return true;
+                return;
             }
         }
-
-        // 【策略C】处理反斜杠转义 (极端情况兜底)
         $strippedDataStr = stripslashes($dataStr);
         if ($strippedDataStr !== $dataStr) {
             if (openssl_verify($strippedDataStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256) === 1) {
                 Log::debug('[Huifu] Verify Strategy C (Stripped Slashes) Passed');
-                return true;
+                return;
             }
         }
 
-        Log::error('[Huifu] All Verification Strategies Failed', [
-            'sign_sample' => substr($sign, 0, 20) . '...',
-            'data_sample' => substr($dataStr, 0, 100) . '...'
+        Log::error('[Huifu] Signature Verify Failed', [
+            'sign_prefix' => substr($sign, 0, 10) . '...',
+            'body_sample' => substr($dataStr, 0, 200),
+            'strategies_tried' => ['Raw', 'Sorted', 'Stripped']
         ]);
 
-        return false;
+        throw new HuifuApiException(['resp_code' => 'FAIL', 'resp_desc' => '验签失败']);
     }
 
     /**
