@@ -148,9 +148,6 @@ readonly class HuifuService
     /**
      * 8. 执行并解析
      */
-    /**
-     * 8. 执行并解析
-     */
     public function exec(object $request): array
     {
         $seqId = method_exists($request, 'getReqSeqId') ? $request->getReqSeqId() : 'N/A';
@@ -160,39 +157,42 @@ readonly class HuifuService
             $client = new BsPayClient();
             $result = $client->postRequest($request);
 
-            // 检查网络错误或SDK内部错误
+            // 1. 检查 SDK 层面/网络层面的错误
             if (!$result || (method_exists($result, 'isError') && $result->isError())) {
                 $errorInfo = method_exists($result, 'getErrorInfo') ? $result->getErrorInfo() : ['msg' => 'Unknown Error'];
-
-                // 【修复核心】：兼容 getErrorInfo 返回字符串的情况
                 if (is_string($errorInfo)) {
-                    $errorInfo = ['msg' => $errorInfo, 'resp_desc' => $errorInfo];
+                    $errorInfo = ['resp_code' => 'SDK_ERROR', 'resp_desc' => $errorInfo];
                 }
 
                 Log::error('[Huifu] API Error', ['req_id' => $seqId, 'error' => $errorInfo]);
                 throw new HuifuApiException($errorInfo);
             }
 
-            // 获取响应数据
+            // 2. 获取响应数据
             $rawResponse = method_exists($result, 'getRspDatas') ? $result->getRspDatas() : [];
-            $data = $rawResponse['data'] ?? $rawResponse; // 兼容不同接口返回结构
+            $data = $rawResponse['data'] ?? $rawResponse;
 
-            // 检查业务逻辑错误 (resp_code 非 00000000)
-            if (isset($data['resp_code']) && $data['resp_code'] !== '00000000') {
+            // 3. 检查业务逻辑错误
+            $successCodes = ['00000000', '00000100'];
+
+            if (isset($data['resp_code']) && !in_array($data['resp_code'], $successCodes)) {
                 Log::error('[Huifu] Business Error', ['req_id' => $seqId, 'resp' => $data]);
                 throw new HuifuApiException($data);
             }
 
             return $data;
         } catch (\Exception $e) {
-            // 如果捕获的是我们自己抛出的异常，直接向上抛
+            // 如果已经是 HuifuApiException，直接往上抛
             if ($e instanceof HuifuApiException) {
                 throw $e;
             }
 
             Log::error('[Huifu] Exec Exception: ' . $e->getMessage());
-            // 包装其他异常
-            throw new HuifuApiException(['msg' => $e->getMessage(), 'resp_desc' => $e->getMessage()]);
+            // 【修复2】包装成数组
+            throw new HuifuApiException([
+                'resp_code' => 'SYS_EXCEPTION',
+                'resp_desc' => $e->getMessage()
+            ]);
         }
     }
 
