@@ -10,5 +10,5 @@ return [
     'log_path'              => 'huifu',
 
     // 默认的小程序配置，也可通过 services.php 读取
-    'sub_appid'             => env('WECHAT_MINI_APP_ID', ''),
+    'sub_appid'             => env('WECHAT_MINI_APP_APPID', ''),
 ];
