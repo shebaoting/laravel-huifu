@@ -266,25 +266,18 @@ readonly class HuifuService
      * @return void
      * @throws HuifuApiException
      */
+    /**
+     * 验证签名 (深度调试版)
+     *
+     * @param array $data 回调数据
+     * @param string|null $body 原始请求体
+     * @return void
+     * @throws HuifuApiException
+     */
     protected function verifySign(array $data, $body = null): void
     {
-        if ($body === null) {
-            $body = request()->getContent();
-        }
-        $dataStr = (string) $body;
-
-        $sign = $data['sign'] ?? '';
-        if (empty($sign)) {
-            Log::error('[Huifu] Missing Signature', ['data' => $data]);
-            throw new HuifuApiException(['resp_code' => 'FAIL', 'resp_desc' => '回调缺少签名参数']);
-        }
-
+        // 1. 获取公钥
         $publicKey = config('huifu.rsa_huifu_public_key');
-
-        if (empty($publicKey)) {
-            Log::error('[Huifu] Config Error: rsa_huifu_public_key not found in config/huifu.php');
-            throw new HuifuApiException(['resp_code' => 'FAIL', 'resp_desc' => '系统公钥未配置']);
-        }
         $publicKey = (string) $publicKey;
 
         if (!str_contains($publicKey, 'BEGIN PUBLIC KEY')) {
@@ -293,38 +286,80 @@ readonly class HuifuService
                 "-----END PUBLIC KEY-----";
         }
 
-        $verifyA = openssl_verify($dataStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256);
-        if ($verifyA === 1) {
-            return; // 验签通过
+        // 2. 准备数据
+        if ($body === null) {
+            $body = request()->getContent();
+        }
+        $dataStr = (string) $body;
+        $sign = $data['sign'] ?? '';
+
+        if (empty($sign)) {
+            Log::warning('[Huifu Debug] No sign');
+            return;
         }
 
+        $decodedSign = base64_decode($sign);
+
+        // 3. 构建所有可能的待签名字符串 (Debug Candidates)
+        $candidates = [];
+
+        // Candidate 1: 原始 Body
+        $candidates['raw_body'] = $dataStr;
+
+        // Candidate 2: 去转义的 Body
+        $candidates['stripped_body'] = stripslashes($dataStr);
+
+        // Candidate 3: 仅 resp_data 的值 (如果是字符串)
+        if (isset($data['resp_data']) && is_string($data['resp_data'])) {
+            $candidates['resp_data_string'] = $data['resp_data'];
+        }
+
+        // Candidate 4: 仅 resp_data 的值 (去转义)
+        if (isset($data['resp_data']) && is_string($data['resp_data'])) {
+            $candidates['resp_data_stripped'] = stripslashes($data['resp_data']);
+        }
+
+        // Candidate 5: SDK 排序逻辑 (如果可用)
         if (class_exists(BsPayTools::class)) {
             $dataForSort = $data;
             unset($dataForSort['sign']);
-            try {
-                ksort($dataForSort);
-                $paramStr = json_encode($dataForSort, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-                if (openssl_verify($paramStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256) === 1) {
-                    return;
+            ksort($dataForSort);
+            // 尝试不同的 JSON 编码选项
+            $candidates['sdk_sort_unescaped'] = json_encode($dataForSort, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            $candidates['sdk_sort_std'] = json_encode($dataForSort);
+        }
+
+        // 4. 逐个尝试并记录日志
+        $successStrategy = null;
+        foreach ($candidates as $name => $content) {
+            $verifyResult = openssl_verify($content, $decodedSign, $publicKey, OPENSSL_ALGO_SHA256);
+
+            // 记录详细的调试日志
+            Log::info("[Huifu Debug] Testing Strategy: {$name}", [
+                'verify_result' => $verifyResult, // 1=Success, 0=Fail, -1=Error
+                'content_sample' => substr($content, 0, 50) . '...',
+                'content_len' => strlen($content)
+            ]);
+
+            if ($verifyResult === 1) {
+                $successStrategy = $name;
+                break;
+            } elseif ($verifyResult === -1) {
+                // 如果 OpenSSL 报错，记录错误信息
+                while ($msg = openssl_error_string()) {
+                    Log::error("[Huifu Debug] OpenSSL Error ({$name}): {$msg}");
                 }
-            } catch (\Exception $e) {
-                // 忽略排序转换错误
             }
         }
 
-        $strippedDataStr = stripslashes($dataStr);
-        if ($strippedDataStr !== $dataStr) {
-            if (openssl_verify($strippedDataStr, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256) === 1) {
-                return;
-            }
+        if ($successStrategy) {
+            Log::info("[Huifu Debug] Verify Success using: {$successStrategy}");
+            return;
         }
 
-        Log::error('[Huifu] Signature Verify Failed', [
-            'sign_sample' => substr($sign, 0, 10) . '...',
-            'data_len'    => strlen($dataStr)
-        ]);
-
-        throw new HuifuApiException(['resp_code' => 'FAIL', 'resp_desc' => '验签失败']);
+        // 失败时抛出异常
+        Log::error('[Huifu Debug] All strategies failed', ['public_key_sample' => substr($publicKey, 0, 30)]);
+        throw new HuifuApiException(['resp_code' => 'FAIL', 'resp_desc' => '验签失败 (Debug Mode)']);
     }
 
     /**
