@@ -1,0 +1,182 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Shebaoting\Huifu\Services;
+
+use BsPaySdk\core\BsPayClient;
+use BsPaySdk\core\BsPayTools;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
+use Shebaoting\Huifu\Exceptions\HuifuApiException;
+
+readonly class HuifuService
+{
+    /**
+     * 1. 小程序下单 (傻瓜式)
+     */
+    public function miniAppPay(string $orderNo, float|string $amount, string $desc, string $openid, array $extra = []): array
+    {
+        $wxData = [
+            'sub_appid' => config('huifu.sub_appid'),
+            'openid'    => $openid,
+        ];
+
+        return $this->request(\BsPaySdk\request\V2TradePaymentJspayRequest::class, [
+            'req_seq_id'      => $orderNo,
+            'trans_amt'       => $amount,
+            'goods_desc'      => $desc,
+            'trade_type'      => 'T_MINIAPP',
+            'delay_acct_flag' => $extra['delay_acct_flag'] ?? 'Y',
+            'wx_data'         => json_encode($wxData), // 自动处理 JSON 序列化
+            ...$extra
+        ]);
+    }
+
+    /**
+     * 2. 按比例分账 (傻瓜式)
+     * splits 格式: ['商户号' => 0.9, '商户号2' => 0.05]
+     */
+    public function splitByRatio(string $orderNo, string $orderDate, float $totalAmount, array $splits): array
+    {
+        $acctInfos = [];
+        foreach ($splits as $huifuId => $ratio) {
+            $acctInfos[] = [
+                'huifu_id' => $huifuId,
+                'div_amt'  => number_format(round($totalAmount * $ratio, 2), 2, '.', ''),
+            ];
+        }
+        return $this->confirmAllocation($orderNo, $orderDate, $totalAmount, $acctInfos);
+    }
+
+    /**
+     * 3. 按固定金额分账 (傻瓜式)
+     */
+    public function splitByAmount(string $orderNo, string $orderDate, array $amounts): array
+    {
+        $acctInfos = [];
+        foreach ($amounts as $huifuId => $amt) {
+            $acctInfos[] = ['huifu_id' => $huifuId, 'div_amt' => $amt];
+        }
+        return $this->confirmAllocation($orderNo, $orderDate, (float)array_sum($amounts), $acctInfos);
+    }
+
+    /**
+     * 4. 确认分账 (底层)
+     */
+    public function confirmAllocation(string $orderNo, string $orderDate, float $totalAmt, array $acctInfos): array
+    {
+        return $this->request(\BsPaySdk\request\V2TradePaymentDelaytransConfirmRequest::class, [
+            'org_req_seq_id'   => $orderNo,
+            'org_req_date'     => $orderDate,
+            'trans_amt'        => $totalAmt,
+            'acct_split_bunch' => json_encode(['acct_infos' => $acctInfos]),
+        ]);
+    }
+
+    /**
+     * 5. 余额查询
+     */
+    public function getBalance(string $huifuId = null): float
+    {
+        $res = $this->request(\BsPaySdk\request\V2TradeAcctpaymentBalanceQueryRequest::class, [
+            'huifu_id' => $huifuId ?? config('huifu.huifu_id')
+        ]);
+        return (float) ($res['acct_bal'] ?? 0);
+    }
+
+    /**
+     * 6. 图片上传 (傻瓜式：直接传本地路径)
+     */
+    public function uploadImage(string $localPath, string $fileType = 'F55'): string
+    {
+        $res = $this->request(\BsPaySdk\request\V2SupplementaryPictureRequest::class, [
+            'file_type' => $fileType,
+            'file'      => new \CURLFile($localPath),
+        ]);
+        return $res['file_id'] ?? '';
+    }
+
+    /**
+     * 7. 自动纠错的万能请求工厂
+     */
+    public function request(string $requestClass, array $params = []): array
+    {
+        $request = new $requestClass();
+
+        // 自动填充日期
+        if (method_exists($request, 'setReqDate')) $request->setReqDate(date('Ymd'));
+        // 自动生成流水号
+        if (method_exists($request, 'setReqSeqId') && empty($params['req_seq_id'])) {
+            $params['req_seq_id'] = date('YmdHis') . Str::random(8);
+        }
+        // 自动填充主商户号
+        if (method_exists($request, 'setHuifuId') && empty($params['huifu_id'])) {
+            $request->setHuifuId(config('huifu.huifu_id'));
+        }
+
+        // 自动进行金额格式化 (傻瓜化核心)
+        $this->formatAmounts($params);
+
+        foreach ($params as $key => $value) {
+            $method = 'set' . str_replace('_', '', ucwords($key, '_'));
+            if (method_exists($request, $method)) {
+                $request->$method($value);
+            }
+        }
+
+        return $this->exec($request);
+    }
+
+    /**
+     * 8. 执行并解析私有属性 (解决你之前的空数组报错)
+     */
+    public function exec(object $request): array
+    {
+        Log::withContext(['huifu_req_id' => $request->getReqSeqId()]);
+
+        $client = new BsPayClient();
+        $result = $client->postRequest($request);
+
+        // 核心：调用带 s 的方法获取私有属性
+        $rawResponse = method_exists($result, 'getRspDatas') ? $result->getRspDatas() : [];
+
+        if (!$result || (method_exists($result, 'isError') && $result->isError())) {
+            $errorInfo = method_exists($result, 'getErrorInfo') ? $result->getErrorInfo() : ['msg' => 'Unknown Error'];
+            throw new HuifuApiException($errorInfo);
+        }
+
+        return $rawResponse['data'] ?? $rawResponse;
+    }
+
+    /**
+     * 一键处理回调
+     */
+    public function handleCallback(callable $callback)
+    {
+        $dataStr = request()->input('resp_data');
+        $sign = request()->input('sign');
+
+        if (!$dataStr || !$sign || !$this->verifySign($dataStr, $sign)) {
+            return response('fail', 400);
+        }
+
+        if ($callback(json_decode($dataStr, true))) {
+            return response('success');
+        }
+        return response('fail');
+    }
+
+    public function verifySign(string $dataStr, string $sign): bool
+    {
+        return (bool) BsPayTools::verifySign_sort($sign, json_decode($dataStr, true), config('huifu.rsa_huifu_public_key'));
+    }
+
+    private function formatAmounts(array &$params): void
+    {
+        $keys = ['trans_amt', 'ord_amt', 'div_amt', 'cash_amt', 'refund_amt'];
+        foreach ($keys as $k) {
+            if (isset($params[$k])) $params[$k] = number_format((float)$params[$k], 2, '.', '');
+        }
+    }
+}
