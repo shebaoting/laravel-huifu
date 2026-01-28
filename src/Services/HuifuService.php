@@ -15,6 +15,7 @@ use BsPaySdk\request\V2TradeAcctpaymentBalanceQueryRequest;
 use BsPaySdk\request\V2SupplementaryPictureRequest;
 use BsPaySdk\request\V2TradePaymentScanpayRefundRequest;
 use BsPaySdk\request\V3TradePaymentScanpayQueryRequest;
+use BsPaySdk\request\V2MerchantBasicdataQueryRequest;
 
 readonly class HuifuService
 {
@@ -270,6 +271,22 @@ readonly class HuifuService
         $keys = ['trans_amt', 'ord_amt', 'div_amt', 'cash_amt', 'refund_amt'];
         foreach ($keys as $k) {
             if (isset($params[$k])) $params[$k] = number_format((float)$params[$k], 2, '.', '');
+        }
+    }
+
+    /**
+     * 获取商户详细信息（实时）
+     */
+    public function getMerchantDetail(string $huifuId): array
+    {
+        try {
+            return $this->request(V2MerchantBasicdataQueryRequest::class, [
+                'huifu_id' => $huifuId,
+            ]);
+        } catch (\Exception $e) {
+            // 记录日志，但不直接抛出异常，让详情页能显示“查询失败”
+            \Log::error("查询汇付商户详情失败: " . $e->getMessage());
+            return [];
         }
     }
 }
