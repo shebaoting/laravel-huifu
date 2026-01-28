@@ -16,6 +16,7 @@ use BsPaySdk\request\V2SupplementaryPictureRequest;
 use BsPaySdk\request\V2TradePaymentScanpayRefundRequest;
 use BsPaySdk\request\V3TradePaymentScanpayQueryRequest;
 use BsPaySdk\request\V2MerchantBasicdataQueryRequest;
+use BsPaySdk\request\V2UserBasicdataQueryRequest;
 
 readonly class HuifuService
 {
@@ -287,6 +288,24 @@ readonly class HuifuService
             // 记录日志，但不直接抛出异常，让详情页能显示“查询失败”
             \Log::error("查询汇付商户详情失败: " . $e->getMessage());
             return [];
+        }
+    }
+
+    /**
+     * 获取汇付用户信息
+     * 对应您提供的 API 文档
+     */
+    public function getUserDetail(string $huifuId): array
+    {
+        try {
+            // request 方法会自动处理 req_date 和 req_seq_id
+            return $this->request(V2UserBasicdataQueryRequest::class, [
+                'huifu_id' => $huifuId,
+            ]);
+        } catch (\Exception $e) {
+            \Log::error("查询汇付用户信息失败: " . $e->getMessage());
+            // 返回错误信息以便在前端显示
+            return ['error' => '接口调用失败: ' . $e->getMessage()];
         }
     }
 }
