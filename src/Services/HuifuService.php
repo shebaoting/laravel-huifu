@@ -64,6 +64,7 @@ readonly class HuifuService
         // 构造分账对象
         $splitBunch = [
             'percentage_flag' => 'Y', // 按百分比
+            'total_div_amt'   => number_format($totalAmount, 2, '.', ''),
             'acct_infos'      => $acctInfos,
         ];
 
@@ -102,7 +103,7 @@ readonly class HuifuService
         // 注意：API 要求 acct_split_bunch 是一个 JSON 字符串
         $splitBunch = [
             'percentage_flag' => 'N', // N: 按金额分账
-            'total_div_amt'   => number_format($totalDivAmt, 2, '.', ''),
+            // 'total_div_amt'   => number_format($totalDivAmt, 2, '.', ''),
             'acct_infos'      => $acctInfos,
         ];
 
