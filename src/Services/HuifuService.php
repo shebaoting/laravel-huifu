@@ -21,11 +21,10 @@ use BsPaySdk\request\V2UserBasicdataQueryRequest;
 readonly class HuifuService
 {
     /**
-     * 1. 小程序下单 (傻瓜式)
+     * 1. 小程序下单
      */
     public function miniAppPay(string $orderNo, float|string $amount, string $desc, string $openid, array $extra = []): array
     {
-        // 构造微信参数，注意 key 为 openid
         $wxData = [
             'sub_appid' => config('huifu.sub_appid') ?: config('services.wechat.mini_app_id'),
             'openid'    => $openid,
@@ -36,51 +35,86 @@ readonly class HuifuService
             'trans_amt'       => $amount,
             'goods_desc'      => $desc,
             'trade_type'      => 'T_MINIAPP',
-            // 以下参数 SDK 类中没有定义 Setter，会自动进入 extendInfo
             'delay_acct_flag' => $extra['delay_acct_flag'] ?? 'Y',
             'notify_url'      => route('api.v1.weapp.payment.huifu_notify'),
-            'wx_data'         => json_encode($wxData), // 必须是 JSON 字符串
+            'wx_data'         => json_encode($wxData),
             ...$extra
         ]);
     }
 
     /**
-     * 2. 按比例分账
+     * 2. 按比例分账 (更新：适配 percentage_flag = Y)
+     *
+     * @param string $orderNo 原交易流水号
+     * @param string $orderDate 原交易日期
+     * @param float $totalAmount 原交易总金额（暂时未使用，但保留参数位置）
+     * @param array $splits 比例数组 ['商户号' => '100.00', '商户号2' => '50.00'] (注意：传字符串百分比，如 100.00 代表 100%)
      */
     public function splitByRatio(string $orderNo, string $orderDate, float $totalAmount, array $splits): array
     {
         $acctInfos = [];
-        foreach ($splits as $huifuId => $ratio) {
+        foreach ($splits as $huifuId => $percentage) {
             $acctInfos[] = [
-                'huifu_id' => $huifuId,
-                'div_amt'  => number_format(round($totalAmount * $ratio, 2), 2, '.', ''),
+                'huifu_id'       => (string)$huifuId,
+                'percentage_div' => (string)$percentage . '%', // 根据文档示例，如果不需要%请自行移除
             ];
         }
-        return $this->confirmAllocation($orderNo, $orderDate, $totalAmount, $acctInfos);
+
+        // 构造分账对象
+        $splitBunch = [
+            'percentage_flag' => 'Y', // 按百分比
+            'acct_infos'      => $acctInfos,
+        ];
+
+        return $this->confirmAllocation($orderNo, $orderDate, $splitBunch);
     }
 
     /**
-     * 3. 按固定金额分账
+     * 3. 按固定金额分账 (更新：适配 percentage_flag = N)
+     *
+     * @param string $orderNo 原交易流水号
+     * @param string $orderDate 原交易日期
+     * @param array $amounts 金额数组 ['商户号' => 10.50]
      */
     public function splitByAmount(string $orderNo, string $orderDate, array $amounts): array
     {
         $acctInfos = [];
+        $totalDivAmt = 0.00;
+
         foreach ($amounts as $huifuId => $amt) {
-            $acctInfos[] = ['huifu_id' => $huifuId, 'div_amt' => $amt];
+            $floatAmt = (float)$amt;
+            $totalDivAmt += $floatAmt;
+
+            $acctInfos[] = [
+                'huifu_id' => (string)$huifuId,
+                'div_amt'  => number_format($floatAmt, 2, '.', ''),
+            ];
         }
-        return $this->confirmAllocation($orderNo, $orderDate, (float)array_sum($amounts), $acctInfos);
+
+        // 构造分账对象
+        $splitBunch = [
+            'percentage_flag' => 'N', // 按金额
+            'total_div_amt'   => number_format($totalDivAmt, 2, '.', ''), // 本次分账总金额
+            'acct_infos'      => $acctInfos,
+        ];
+
+        return $this->confirmAllocation($orderNo, $orderDate, $splitBunch);
     }
 
     /**
-     * 4. 确认分账 (底层)
+     * 4. 确认分账 (底层更新)
+     *
+     * @param string $orderNo 原交易流水号
+     * @param string $orderDate 原交易日期
+     * @param array $splitBunch 构造好的分账对象结构
      */
-    public function confirmAllocation(string $orderNo, string $orderDate, float $totalAmt, array $acctInfos): array
+    public function confirmAllocation(string $orderNo, string $orderDate, array $splitBunch): array
     {
+        // 这里的 huifu_id 是平台商户号，request 方法会自动通过 config 注入
         return $this->request(V2TradePaymentDelaytransConfirmRequest::class, [
             'org_req_seq_id'   => $orderNo,
             'org_req_date'     => $orderDate,
-            'trans_amt'        => $totalAmt,
-            'acct_split_bunch' => json_encode(['acct_infos' => $acctInfos]),
+            'acct_split_bunch' => json_encode($splitBunch, JSON_UNESCAPED_UNICODE),
         ]);
     }
 
@@ -114,43 +148,31 @@ readonly class HuifuService
     {
         $request = new $requestClass();
 
-        // 自动填充日期
         if (method_exists($request, 'setReqDate')) $request->setReqDate(date('Ymd'));
-        // 自动生成流水号
         if (method_exists($request, 'setReqSeqId') && empty($params['req_seq_id'])) {
             $params['req_seq_id'] = date('YmdHis') . Str::random(8);
         }
-        // 自动填充主商户号
+        // 自动填充主商户号 (API文档中的顶级 huifu_id，通常是平台号)
         if (method_exists($request, 'setHuifuId') && empty($params['huifu_id'])) {
             $request->setHuifuId(config('huifu.huifu_id'));
         }
 
-        // 自动进行金额格式化
         $this->formatAmounts($params);
 
-        // --- 【核心修复逻辑开始】 ---
         $extendInfos = [];
 
         foreach ($params as $key => $value) {
-            // 将下划线转驼峰 (如 trans_amt -> setTransAmt)
             $method = 'set' . str_replace('_', '', ucwords($key, '_'));
-
-            // 1. 如果 SDK 类中有 set 方法，直接调用
             if (method_exists($request, $method)) {
                 $request->$method($value);
-            }
-            // 2. 如果没有 set 方法，说明这是扩展参数 (如 wx_data, notify_url)，放入 extendInfo
-            else {
+            } else {
                 $extendInfos[$key] = $value;
             }
         }
 
-        // 如果有扩展参数，统一注入到 SDK 对象中
         if (!empty($extendInfos)) {
-            // SDK 的 BaseRequest 有 setExtendInfo 方法
             $request->setExtendInfo($extendInfos);
         }
-        // --- 【核心修复逻辑结束】 ---
 
         return $this->exec($request);
     }
@@ -167,17 +189,15 @@ readonly class HuifuService
 
         $rawResponse = method_exists($result, 'getRspDatas') ? $result->getRspDatas() : [];
 
-        if (!$result || (method_exists($result, 'isError') && $result->isError())) {
-            $errorInfo = method_exists($result, 'getErrorInfo') ? $result->getErrorInfo() : ['msg' => 'Unknown Error'];
-            // 记录详细错误日志
-            Log::error('[Huifu] API Error', [
-                'request' => (array)$request,
-                'error'   => $errorInfo
-            ]);
-            throw new HuifuApiException($errorInfo);
+        $data = $rawResponse['data'] ?? [];
+        $respCode = $data['resp_code'] ?? ($rawResponse['resp_code'] ?? '');
+
+        if (!in_array($respCode, ['00000000', '00000100'])) {
+            Log::error('[Huifu] API Business Failure', $rawResponse);
+            throw new HuifuApiException($rawResponse);
         }
 
-        return $rawResponse['data'] ?? $rawResponse;
+        return $data;
     }
 
     /**
@@ -225,24 +245,15 @@ readonly class HuifuService
 
     /**
      * 增强版验签方法
-     * 解决 PHP json_decode 将空对象 {} 转为 [] 导致验签失败的问题
      */
     public function verifySign(string $dataStr, string $sign): bool
     {
         $publicKey = config('huifu.rsa_huifu_public_key');
-
-        // 策略 A：直接使用 SDK 的 verifySign 验证原始字符串
-        // 如果汇付返回的 JSON 顺序本身就是排好序的，或者是对原串签名的，这一步直接通过，效率最高。
         if (BsPayTools::verifySign($sign, $dataStr, $publicKey)) {
             return true;
         }
 
-        // 策略 B：由于策略 A 失败（说明顺序不同），我们需要解码、排序、重组后再验
-        // 这里必须处理 PHP 将 {} 转为 [] 的 Bug
         $data = json_decode($dataStr, true);
-
-        // 定义哪些字段如果是空的，必须转回对象 {}
-        // 这些字段名来自汇付文档和你的报错日志
         $forceObjectFields = [
             'risk_check_data',
             'risk_check_info',
@@ -256,14 +267,11 @@ readonly class HuifuService
         ];
 
         foreach ($forceObjectFields as $field) {
-            // 如果字段存在、是数组、且为空，强制转为 (object)[]
-            // 这样 json_encode 就会输出 {} 而不是 []
             if (isset($data[$field]) && is_array($data[$field]) && empty($data[$field])) {
                 $data[$field] = (object)[];
             }
         }
 
-        // 调用 SDK 的排序验签方法
         return (bool) BsPayTools::verifySign_sort($sign, $data, $publicKey);
     }
 
@@ -285,26 +293,22 @@ readonly class HuifuService
                 'huifu_id' => $huifuId,
             ]);
         } catch (\Exception $e) {
-            // 记录日志，但不直接抛出异常，让详情页能显示“查询失败”
             \Log::error("查询汇付商户详情失败: " . $e->getMessage());
             return [];
         }
     }
 
     /**
-     * 获取汇付用户信息
-     * 对应您提供的 API 文档
+     * 获取汇付用户信息（基于 v2/user/basicdata/query 接口）
      */
     public function getUserDetail(string $huifuId): array
     {
         try {
-            // request 方法会自动处理 req_date 和 req_seq_id
             return $this->request(V2UserBasicdataQueryRequest::class, [
                 'huifu_id' => $huifuId,
             ]);
         } catch (\Exception $e) {
             \Log::error("查询汇付用户信息失败: " . $e->getMessage());
-            // 返回错误信息以便在前端显示
             return ['error' => '接口调用失败: ' . $e->getMessage()];
         }
     }
