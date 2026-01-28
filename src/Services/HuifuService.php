@@ -17,6 +17,7 @@ use BsPaySdk\request\V2TradePaymentScanpayRefundRequest;
 use BsPaySdk\request\V3TradePaymentScanpayQueryRequest;
 use BsPaySdk\request\V2MerchantBasicdataQueryRequest;
 use BsPaySdk\request\V2UserBasicdataQueryRequest;
+use BsPaySdk\request\V2TradeSettlementEncashmentRequest;
 
 readonly class HuifuService
 {
@@ -70,11 +71,11 @@ readonly class HuifuService
     }
 
     /**
-     * 3. 按固定金额分账 (更新：适配 percentage_flag = N)
+     * 3. 按固定金额分账 (对应交易确认接口)
      *
-     * @param string $orderNo 原交易流水号
-     * @param string $orderDate 原交易日期
-     * @param array $amounts 金额数组 ['商户号' => 10.50]
+     * @param string $orderNo 原交易流水号 (下单时的 req_seq_id)
+     * @param string $orderDate 原交易日期 (下单时的 req_date, 格式 Ymd)
+     * @param array $amounts 金额数组 ['汇付商户号' => 金额]
      */
     public function splitByAmount(string $orderNo, string $orderDate, array $amounts): array
     {
@@ -83,18 +84,25 @@ readonly class HuifuService
 
         foreach ($amounts as $huifuId => $amt) {
             $floatAmt = (float)$amt;
+            if ($floatAmt <= 0) continue; // 过滤掉 0 元的分账
+
             $totalDivAmt += $floatAmt;
 
             $acctInfos[] = [
-                'huifu_id' => (string)$huifuId,
-                'div_amt'  => number_format($floatAmt, 2, '.', ''),
+                'huifu_id' => (string)$huifuId, // 必须转为字符串
+                'div_amt'  => number_format($floatAmt, 2, '.', ''), // 必须是两位小数的字符串
             ];
         }
 
-        // 构造分账对象
+        if (empty($acctInfos)) {
+            throw new \Exception('分账接收方金额不能全部为0');
+        }
+
+        // 构造分账对象结构 (参考你的 API 截图)
+        // 注意：API 要求 acct_split_bunch 是一个 JSON 字符串
         $splitBunch = [
-            'percentage_flag' => 'N', // 按金额
-            'total_div_amt'   => number_format($totalDivAmt, 2, '.', ''), // 本次分账总金额
+            'percentage_flag' => 'N', // N: 按金额分账
+            'total_div_amt'   => number_format($totalDivAmt, 2, '.', ''),
             'acct_infos'      => $acctInfos,
         ];
 
@@ -102,15 +110,11 @@ readonly class HuifuService
     }
 
     /**
-     * 4. 确认分账 (底层更新)
-     *
-     * @param string $orderNo 原交易流水号
-     * @param string $orderDate 原交易日期
-     * @param array $splitBunch 构造好的分账对象结构
+     * 4. 底层确认分账方法
      */
     public function confirmAllocation(string $orderNo, string $orderDate, array $splitBunch): array
     {
-        // 这里的 huifu_id 是平台商户号，request 方法会自动通过 config 注入
+
         return $this->request(V2TradePaymentDelaytransConfirmRequest::class, [
             'org_req_seq_id'   => $orderNo,
             'org_req_date'     => $orderDate,
@@ -311,5 +315,16 @@ readonly class HuifuService
             \Log::error("查询汇付用户信息失败: " . $e->getMessage());
             return ['error' => '接口调用失败: ' . $e->getMessage()];
         }
+    }
+
+    // 自动提现/取现接口 (Command 中会用到)
+    public function cashOut(string $huifuId, float|string $amount): array
+    {
+        return $this->request(V2TradeSettlementEncashmentRequest::class, [
+            'huifu_id' => $huifuId,
+            'cash_amt' => number_format((float)$amount, 2, '.', ''),
+            'into_acct_date_type' => 'T1', // 默认 T+1 到账，费率低
+            // 'token_no' => '', // 如果商户只绑了一张卡，不需要传 token_no
+        ]);
     }
 }
